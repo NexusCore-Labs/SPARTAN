@@ -16,6 +16,10 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+import subprocess
+import sys
+from datetime import date, datetime
+
 import numpy as np
 import streamlit as st
 
@@ -644,7 +648,7 @@ def inject_custom_css() -> None:
             --spartan-ink: #0b1f2a;
             --spartan-teal: #1a7a6d;
             --spartan-sand: #e8efe9;
-            --spartan-amber: #c47a22;
+            --spartan-amber: #2f5a9e;
             --spartan-slate: #3d5563;
         }
 
@@ -749,19 +753,164 @@ def render_header(device_label: str, model_state: str, model_ok: bool) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Data acquisition pipeline helpers
+# ---------------------------------------------------------------------------
+
+
+# Project root — one level above the app/ directory
+_PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
+_RAW_TIF = Path(_PROJECT_ROOT) / "spartan" / "data" / "raw" / "aoi_scene.tif"
+_CLEAN_TIF = Path(_PROJECT_ROOT) / "spartan" / "data" / "processed" / "clean_scene.tif"
+_PATCHES_DIR = Path(_PROJECT_ROOT) / "spartan" / "data" / "processed" / "patches"
+
+
+@dataclass
+class FetchParams:
+    """Parameters the user enters for data acquisition."""
+    lat: float
+    lon: float
+    start_date: str
+    end_date: str
+    patch_size: int
+
+
+def run_fetch_pipeline(params: FetchParams) -> str:
+    """
+    Execute the Module 1 pipeline (fetch → preprocess → tile) in a subprocess.
+
+    Returns the path to the clean GeoTIFF on success, raises on failure.
+    """
+    cmd = [
+        sys.executable, "train.py",
+        "--lat", str(params.lat),
+        "--lon", str(params.lon),
+        "--start", params.start_date,
+        "--end", params.end_date,
+        "--patch-size", str(params.patch_size),
+    ]
+    result = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        cwd=_PROJECT_ROOT,
+        timeout=300,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Pipeline failed (exit {result.returncode}):\n"
+            f"{result.stdout}\n{result.stderr}"
+        )
+    if not _CLEAN_TIF.is_file():
+        raise FileNotFoundError(
+            f"Pipeline finished but output not found at {_CLEAN_TIF}"
+        )
+    return str(_CLEAN_TIF)
+
+
+# ---------------------------------------------------------------------------
+# Sidebar — supports two input modes
+# ---------------------------------------------------------------------------
+
+
 def render_sidebar() -> Dict[str, Any]:
     with st.sidebar:
         st.markdown("### SPARTAN")
         st.caption(f"v{APP_VERSION} · {SIH_CONTEXT}")
         st.markdown("---")
 
-        uploaded = st.file_uploader(
-            "Upload Sentinel-2 GeoTIFF",
-            type=["tif", "tiff"],
-            accept_multiple_files=False,
-            help="Single- or multi-band GeoTIFF at ~10 m resolution.",
+        # ---- Input mode selector ----
+        input_mode = st.radio(
+            "📥 Input source",
+            options=["Upload GeoTIFF", "Fetch from Sentinel-2"],
+            index=0,
+            help="Upload an existing file, or fetch new data by coordinates and date range.",
+            horizontal=True,
         )
 
+        # ---- Mode 1: File upload (original behaviour) ----
+        uploaded = None
+        fetch_clicked = False
+        fetch_params: Optional[FetchParams] = None
+
+        if input_mode == "Upload GeoTIFF":
+            uploaded = st.file_uploader(
+                "Upload Sentinel-2 GeoTIFF",
+                type=["tif", "tiff"],
+                accept_multiple_files=False,
+                help="Single- or multi-band GeoTIFF at ~10 m resolution.",
+            )
+        else:
+            # ---- Mode 2: Live data fetch ----
+            st.markdown("#### 🛰️ Area of Interest")
+            col_lat, col_lon = st.columns(2)
+            with col_lat:
+                lat = st.number_input(
+                    "Latitude",
+                    min_value=-90.0,
+                    max_value=90.0,
+                    value=19.0760,
+                    step=0.0001,
+                    format="%.4f",
+                    help="Decimal degrees (e.g. 19.0760 for Mumbai).",
+                )
+            with col_lon:
+                lon = st.number_input(
+                    "Longitude",
+                    min_value=-180.0,
+                    max_value=180.0,
+                    value=72.8777,
+                    step=0.0001,
+                    format="%.4f",
+                    help="Decimal degrees (e.g. 72.8777 for Mumbai).",
+                )
+
+            st.markdown("#### 📅 Date Range")
+            col_start, col_end = st.columns(2)
+            with col_start:
+                start = st.date_input(
+                    "Start date",
+                    value=date(2025, 11, 1),
+                    help="First day of the observation window.",
+                )
+            with col_end:
+                end = st.date_input(
+                    "End date",
+                    value=date(2026, 3, 1),
+                    help="Last day of the observation window.",
+                )
+
+            st.markdown("#### 🧩 Patch Settings")
+            patch_size = st.select_slider(
+                "Patch dimensions (px)",
+                options=[64, 128, 256, 512],
+                value=256,
+                help="Pixel size of each tile the clean raster is split into.",
+            )
+
+            # Quick validation
+            if start > end:
+                st.warning("⚠️ Start date is after end date — please adjust.")
+
+            fetch_clicked = st.button(
+                "🚀 Fetch & Process",
+                type="primary",
+                use_container_width=True,
+                disabled=(start > end),
+            )
+
+            fetch_params = FetchParams(
+                lat=lat,
+                lon=lon,
+                start_date=start.isoformat(),
+                end_date=end.isoformat(),
+                patch_size=patch_size,
+            )
+
+        st.markdown("---")
+
+        # ---- Common enhancement controls (visible in both modes) ----
+        st.markdown("#### 🔧 Enhancement")
         band_mode = st.selectbox(
             "Band composition",
             options=[m.value for m in BandMode],
@@ -774,7 +923,6 @@ def render_sidebar() -> Dict[str, Any]:
             index=0,
         )
 
-        st.markdown("#### Processing")
         contrast = st.slider("Contrast", min_value=0.5, max_value=2.5, value=1.0, step=0.05)
         multiplier = st.slider(
             "Enhancement multiplier",
@@ -796,6 +944,9 @@ def render_sidebar() -> Dict[str, Any]:
         "contrast": float(contrast),
         "multiplier": float(multiplier),
         "run": bool(run),
+        "input_mode": input_mode,
+        "fetch_clicked": fetch_clicked,
+        "fetch_params": fetch_params,
     }
 
 
@@ -943,14 +1094,55 @@ def main() -> None:
     )
     render_header(device_label, model_state, bool(model_info.get("ready")))
 
-    # Resolve input raster
+    # -----------------------------------------------------------------
+    # Handle "Fetch from Sentinel-2" mode
+    # -----------------------------------------------------------------
+    if controls["input_mode"] == "Fetch from Sentinel-2" and controls["fetch_clicked"]:
+        params = controls["fetch_params"]
+        if params is not None:
+            st.markdown("---")
+            st.subheader("📡 Data Acquisition Pipeline")
+            st.caption(
+                f"Lat {params.lat:.4f} · Lon {params.lon:.4f} · "
+                f"{params.start_date} → {params.end_date} · "
+                f"Patch {params.patch_size} px"
+            )
+
+            progress = st.progress(0, text="Initialising pipeline…")
+            status_box = st.empty()
+
+            try:
+                # Step indicators
+                progress.progress(10, text="🛰️  Step 1/3 — Fetching Sentinel-2 data…")
+                status_box.info("Connecting to Copernicus STAC API and downloading scene…")
+                tif_path = run_fetch_pipeline(params)
+                progress.progress(75, text="✅ Data fetched & preprocessed successfully!")
+                status_box.success(
+                    f"Clean GeoTIFF saved to `{tif_path}`\n\n"
+                    f"Patches written to `{_PATCHES_DIR}`"
+                )
+                progress.progress(100, text="Pipeline complete ✔")
+
+                # Store path so downstream can load it
+                st.session_state["fetched_tif_path"] = tif_path
+            except Exception as exc:
+                progress.progress(0, text="❌ Pipeline failed")
+                status_box.error(f"Pipeline error: {exc}")
+                st.stop()
+
+    # -----------------------------------------------------------------
+    # Resolve input raster (upload, fetched, or synthetic fallback)
+    # -----------------------------------------------------------------
     source_name = "synthetic_sentinel2.tif"
     array: Optional[np.ndarray] = None
     metadata: Optional[GeoMetadata] = None
     load_error: Optional[str] = None
 
     uploaded = controls["uploaded"]
+    fetched_path: Optional[str] = st.session_state.get("fetched_tif_path")
+
     if uploaded is not None:
+        # User uploaded a file via drag-and-drop
         source_name = uploaded.name
         suffix = Path(source_name).suffix.lower()
         if suffix not in SUPPORTED_EXTENSIONS:
@@ -960,9 +1152,20 @@ def main() -> None:
                 array, metadata = load_geotiff(uploaded.getvalue(), source_name)
             except ValueError as exc:
                 load_error = str(exc)
+
+    elif fetched_path and Path(fetched_path).is_file():
+        # Data was just fetched via the pipeline
+        source_name = Path(fetched_path).name
+        try:
+            raw_bytes = Path(fetched_path).read_bytes()
+            array, metadata = load_geotiff(raw_bytes, source_name)
+        except (ValueError, Exception) as exc:
+            load_error = f"Could not read fetched file: {exc}"
+
     else:
         st.markdown(
-            "Upload a Sentinel-2 GeoTIFF in the sidebar, or run on the "
+            "Upload a Sentinel-2 GeoTIFF in the sidebar, "
+            "**fetch new data** from Sentinel-2, or run on the "
             "**synthetic placeholder** to exercise the pipeline."
         )
 
