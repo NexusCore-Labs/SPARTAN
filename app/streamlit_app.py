@@ -48,7 +48,11 @@ except ImportError:  # pragma: no cover
     torch = None  # type: ignore[assignment]
 
 try:
-    from streamlit_image_comparison import image_comparison as _image_comparison
+    from importlib import import_module
+
+    _image_comparison = import_module(
+        "streamlit_image_comparison"
+    ).image_comparison
 
     HAS_IMAGE_COMPARISON = True
 except ImportError:  # pragma: no cover
@@ -474,7 +478,10 @@ def compute_ssim(reference: np.ndarray, estimate: np.ndarray) -> float:
     Avoids a hard dependency on scikit-image.
     """
     try:
-        from skimage.metrics import structural_similarity as sk_ssim
+        # Import optionally without requiring scikit-image for the fallback path.
+        import importlib
+
+        sk_ssim = importlib.import_module("skimage.metrics").structural_similarity
 
         ref = np.moveaxis(reference, 0, -1)
         est = np.moveaxis(estimate, 0, -1)
