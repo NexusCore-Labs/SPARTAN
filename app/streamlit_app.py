@@ -13,6 +13,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from importlib import import_module
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -42,17 +43,24 @@ except ImportError:  # pragma: no cover
 
 try:
     import torch
-    from torchmetrics.functional.image import (
-        peak_signal_noise_ratio,
-        structural_similarity_index_measure,
-    )
-
     HAS_TORCH = True
 except ImportError:  # pragma: no cover
     HAS_TORCH = False
     torch = None  # type: ignore[assignment]
-    peak_signal_noise_ratio = None  # type: ignore[assignment]
-    structural_similarity_index_measure = None  # type: ignore[assignment]
+
+if HAS_TORCH:
+    try:
+        _torchmetrics_image = import_module("torchmetrics.functional.image")
+        peak_signal_noise_ratio = _torchmetrics_image.peak_signal_noise_ratio
+        structural_similarity_index_measure = (
+            _torchmetrics_image.structural_similarity_index_measure
+        )
+    except (ImportError, AttributeError):  # pragma: no cover
+        peak_signal_noise_ratio = None
+        structural_similarity_index_measure = None
+else:  # pragma: no cover
+    peak_signal_noise_ratio = None
+    structural_similarity_index_measure = None
 
 from spartan.data.preprocessor import preprocess_array
 
@@ -285,7 +293,7 @@ def load_model(model_name: str, device: str) -> Dict[str, Any]:
 
 
 def prepare_display_rgb(
-    tensor_01: torch.Tensor | np.ndarray,
+    tensor_01: Any,
     contrast: float = 1.0,
 ) -> np.ndarray:
     """
@@ -316,11 +324,11 @@ def prepare_display_rgb(
 
 
 def boost_high_frequency_details(
-    sr_output: torch.Tensor,
-    input_resized: torch.Tensor,
+    sr_output: "torch.Tensor",
+    input_resized: Any,
     multiplier: float = 1.0,
     contrast: float = 1.0,
-) -> torch.Tensor:
+) -> "torch.Tensor":
     """
     Adaptive high-frequency detail and edge sharpening boost on sr_output.
     Driven by the 'Enhancement multiplier' and 'Contrast' sliders.
@@ -357,10 +365,23 @@ def boost_high_frequency_details(
 
 def calculate_metrics(sr: "torch.Tensor", ref: "torch.Tensor") -> "tuple[float, float]":
     sr_c, ref_c = torch.clamp(sr, 0.0, 1.0), torch.clamp(ref, 0.0, 1.0)
-    return (
-        peak_signal_noise_ratio(sr_c, ref_c, data_range=1.0).item(),
-        structural_similarity_index_measure(sr_c, ref_c, data_range=1.0).item(),
+    if peak_signal_noise_ratio is not None and structural_similarity_index_measure is not None:
+        return (
+            peak_signal_noise_ratio(sr_c, ref_c, data_range=1.0).item(),
+            structural_similarity_index_measure(sr_c, ref_c, data_range=1.0).item(),
+        )
+
+    mse = torch.mean((sr_c - ref_c) ** 2)
+    psnr = 99.0 if mse.item() <= 1e-12 else float(-10.0 * torch.log10(mse).item())
+    mean_sr, mean_ref = sr_c.mean(), ref_c.mean()
+    var_sr = sr_c.var(unbiased=False)
+    var_ref = ref_c.var(unbiased=False)
+    covariance = ((sr_c - mean_sr) * (ref_c - mean_ref)).mean()
+    c1, c2 = 0.01 ** 2, 0.03 ** 2
+    ssim = ((2 * mean_sr * mean_ref + c1) * (2 * covariance + c2)) / (
+        (mean_sr ** 2 + mean_ref ** 2 + c1) * (var_sr + var_ref + c2)
     )
+    return psnr, float(ssim.item())
 
 
 
