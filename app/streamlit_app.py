@@ -22,6 +22,7 @@ from datetime import date, datetime
 
 import numpy as np
 import streamlit as st
+from PIL import Image
 
 # ---------------------------------------------------------------------------
 # Optional heavy / UI dependencies — degrade gracefully when absent
@@ -409,6 +410,42 @@ def _synthetic_sentinel2(
         tags={"source": "synthetic_sentinel2_placeholder"},
     )
     return array, meta
+
+
+@st.cache_data(show_spinner=False)
+def _default_satellite_scene() -> Tuple[np.ndarray, GeoMetadata]:
+    """Load the bundled World Imagery scene used for the first-run preview."""
+    asset_path = Path(__file__).resolve().parent.parent / "public" / "assets" / "satellite_scene.jpg"
+    if not asset_path.is_file():
+        logger.warning("Default satellite asset missing: %s", asset_path)
+        return _synthetic_sentinel2()
+
+    with Image.open(asset_path) as image:
+        rgb = np.asarray(image.convert("RGB"), dtype=np.float32) / 255.0
+
+    # Keep the app's Sentinel-2 band convention: B2, B3, B4, B8.
+    blue, green, red = (rgb[:, :, i] for i in range(3))
+    nir = np.clip(green * 0.72 + red * 0.28, 0.0, 1.0)
+    array = np.stack([blue, green, red, nir], axis=0) * 10000.0
+    height, width = array.shape[1:]
+    resolution = (10.0, 10.0)
+    transform = (
+        Affine(resolution[0], 0.0, 77.00, 0.0, -resolution[1], 28.68)
+        if HAS_RASTERIO
+        else None
+    )
+    meta = GeoMetadata(
+        crs="EPSG:4326",
+        bounds=(77.00, 28.68 - height * 0.0001, 77.00 + width * 0.0001, 28.68),
+        band_count=4,
+        width=width,
+        height=height,
+        resolution=resolution,
+        dtype="float32",
+        transform=transform,
+        tags={"source": "ArcGIS World Imagery", "scene": "Delhi default preview"},
+    )
+    return array.astype(np.float32), meta
 
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -876,24 +913,56 @@ def inject_custom_css() -> None:
         @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
 
         :root {
-            --spartan-ink: #0b1f2a;
-            --spartan-teal: #1a7a6d;
-            --spartan-sand: #e8efe9;
-            --spartan-amber: #2f5a9e;
-            --spartan-slate: #3d5563;
+            --spartan-ink: #d4d4d4;
+            --spartan-panel: #252526;
+            --spartan-panel-raised: #2d2d30;
+            --spartan-blue: #569cd6;
+            --spartan-blue-soft: #264f78;
+            --spartan-amber: #c8a96b;
+            --spartan-slate: #9da3a8;
+            --spartan-line: #3f4145;
         }
 
         html, body, [class*="css"] {
             font-family: 'IBM Plex Sans', sans-serif;
         }
 
+        .stApp {
+            background: #1e1e1e;
+            color: var(--spartan-ink);
+        }
+        .stApp [data-testid="stHeader"] {
+            background: rgba(30,30,30,0.92);
+        }
+        .stApp h1, .stApp h2, .stApp h3, .stApp h4,
+        .stApp label, .stApp p, .stApp span {
+            color: var(--spartan-ink);
+        }
+
+        .block-container {
+            padding-top: 2rem;
+            padding-bottom: 3rem;
+            max-width: 1500px;
+        }
+
         .spartan-hero {
-            background: linear-gradient(135deg, #0b1f2a 0%, #1a4a52 55%, #1a7a6d 100%);
-            color: #f4faf7;
-            padding: 1.25rem 1.5rem;
-            border-radius: 12px;
-            margin-bottom: 1rem;
-            border: 1px solid rgba(255,255,255,0.08);
+            background: #252526;
+            color: var(--spartan-ink);
+            padding: 1.6rem 1.8rem;
+            border-radius: 8px;
+            margin-bottom: 1.5rem;
+            border: none;
+            position: relative;
+            overflow: hidden;
+        }
+        .spartan-hero::after {
+            content: 'SR / 04';
+            position: absolute;
+            right: 1.6rem;
+            bottom: 1.2rem;
+            color: rgba(212,212,212,0.22);
+            font: 500 0.72rem 'IBM Plex Mono', monospace;
+            letter-spacing: 0.12em;
         }
         .spartan-hero h1 {
             font-size: 1.75rem;
@@ -920,17 +989,45 @@ def inject_custom_css() -> None:
             font-size: 0.75rem;
             padding: 0.28rem 0.65rem;
             border-radius: 999px;
-            background: rgba(255,255,255,0.12);
-            border: 1px solid rgba(255,255,255,0.18);
+            background: #303031;
+            border: 1px solid #484a4f;
         }
-        .badge.ok { background: rgba(26,122,109,0.45); }
-        .badge.warn { background: rgba(196,122,34,0.45); }
+        .badge.ok { background: var(--spartan-blue-soft); }
+        .badge.warn { background: #554a35; }
+
+        .section-kicker {
+            color: var(--spartan-blue);
+            font: 500 0.72rem 'IBM Plex Mono', monospace;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+            margin: 1.3rem 0 0.35rem;
+        }
+
+        .empty-state {
+            background: #252526;
+            border: 1px solid var(--spartan-line);
+            border-left: 4px solid var(--spartan-blue);
+            border-radius: 8px;
+            padding: 1.25rem 1.4rem;
+            margin: 1rem 0 1.4rem;
+        }
+        .empty-state .title {
+            color: #e1e1e1;
+            font-size: 1.05rem;
+            font-weight: 700;
+            margin-bottom: 0.25rem;
+        }
+        .empty-state .copy {
+            color: var(--spartan-slate);
+            font-size: 0.9rem;
+        }
 
         .metric-card {
-            background: var(--spartan-sand);
-            border: 1px solid #c9d6ce;
-            border-radius: 10px;
-            padding: 0.9rem 1rem;
+            background: var(--spartan-panel);
+            border: 1px solid var(--spartan-line);
+            border-top: 3px solid var(--spartan-blue);
+            border-radius: 8px;
+            padding: 1rem 1.1rem;
             text-align: center;
         }
         .metric-card .label {
@@ -943,20 +1040,44 @@ def inject_custom_css() -> None:
             font-family: 'IBM Plex Mono', monospace;
             font-size: 1.45rem;
             font-weight: 500;
-            color: var(--spartan-ink);
+            color: #e1e1e1;
             margin-top: 0.2rem;
         }
 
         section[data-testid="stSidebar"] {
-            background: linear-gradient(180deg, #0b1f2a 0%, #12323a 100%);
+            background: #252526;
+            border-right: none;
         }
         section[data-testid="stSidebar"] * {
-            color: #e8efe9 !important;
+            color: #cccccc !important;
         }
         section[data-testid="stSidebar"] .stSelectbox label,
         section[data-testid="stSidebar"] .stSlider label,
         section[data-testid="stSidebar"] .stFileUploader label {
-            color: #c9d6ce !important;
+            color: #9da3a8 !important;
+        }
+        section[data-testid="stSidebar"] .stButton > button {
+            border-radius: 7px;
+            font-weight: 600;
+        }
+        .stButton > button[kind="primary"] {
+            background: #0e639c;
+            border-color: #1177bb;
+            color: #ffffff;
+        }
+        .stButton > button[kind="primary"]:hover {
+            background: #1177bb;
+            border-color: #1a85c7;
+        }
+        div[data-testid="stExpander"] {
+            border-color: var(--spartan-line);
+            border-radius: 8px;
+        }
+        div[data-testid="stMetric"] {
+            background: var(--spartan-panel);
+            border: 1px solid var(--spartan-line);
+            padding: 0.7rem;
+            border-radius: 8px;
         }
         </style>
         """,
@@ -974,6 +1095,10 @@ def render_header(device_label: str, model_state: str, model_ok: bool) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def render_section_kicker(text: str) -> None:
+    st.markdown(f'<div class="section-kicker">{text}</div>', unsafe_allow_html=True)
 
 
 # ---------------------------------------------------------------------------
@@ -1170,6 +1295,7 @@ def render_sidebar() -> Dict[str, Any]:
 
 
 def render_comparison(original_rgb: np.ndarray, enhanced_rgb: np.ndarray) -> None:
+    render_section_kicker("Visual output")
     st.subheader("Interactive visual comparison")
     st.caption("Original (10 m) vs SPARTAN Enhanced (<2.5 m)")
 
@@ -1245,6 +1371,7 @@ def render_metadata(meta: GeoMetadata, enhanced_meta: GeoMetadata) -> None:
 
 
 def render_metrics(result: EnhancementResult) -> None:
+    render_section_kicker("Model telemetry")
     st.subheader("Analytics & metrics")
     cols = st.columns(3)
     cards = [
@@ -1276,6 +1403,7 @@ def render_metrics(result: EnhancementResult) -> None:
 
 
 def render_export(result: EnhancementResult, source_name: str) -> None:
+    render_section_kicker("Take it with you")
     st.subheader("Export")
     stem = Path(source_name).stem or "spartan"
     out_name = f"{stem}_spartan_sr.tif" if HAS_RASTERIO else f"{stem}_spartan_sr.npy"
@@ -1380,7 +1508,7 @@ def main() -> None:
     # -----------------------------------------------------------------
     # Resolve input raster (upload, fetched, or synthetic fallback)
     # -----------------------------------------------------------------
-    source_name = "synthetic_sentinel2.tif"
+    source_name = "delhi_world_imagery.tif"
     array: Optional[np.ndarray] = None
     metadata: Optional[GeoMetadata] = None
     load_error: Optional[str] = None
@@ -1440,7 +1568,8 @@ def main() -> None:
     if "last_result" not in st.session_state:
         st.session_state["last_result"] = None
 
-    if controls["run"]:
+    is_default_scene = source_name == "delhi_world_imagery.tif"
+    if controls["run"] or (is_default_scene and st.session_state.get("last_result") is None):
         with st.spinner("Running SPARTAN enhancement…"):
             try:
                 result = run_enhancement(
@@ -1461,7 +1590,15 @@ def main() -> None:
 
     result: Optional[EnhancementResult] = st.session_state.get("last_result")
     if result is None:
-        st.info("Configure options in the sidebar, then click **Run Enhancement**.")
+        st.markdown(
+            """
+            <div class="empty-state">
+                <div class="title">Your workspace is staged</div>
+                <div class="copy">Choose a band composition and model, then run enhancement to open the comparison, telemetry, and export panels.</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
         return
 
     render_comparison(result.original_rgb, result.enhanced_rgb)
