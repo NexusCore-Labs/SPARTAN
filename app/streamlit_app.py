@@ -858,6 +858,21 @@ def inject_custom_css() -> None:
     st.markdown(
         """
         <style>
+        #MainMenu {visibility: hidden;}
+        header {visibility: hidden;}
+        footer {visibility: hidden;}
+        .stDeployButton {display:none;}
+        [data-testid="stAppDeployButton"] {display:none;}
+        [data-testid="stToolbarActions"] {display:none;}
+        [data-testid="stToolbar"] {visibility: hidden; display: none;}
+        [data-testid="stHeader"] {display: none;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        """
+        <style>
         @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
 
         :root {
@@ -950,19 +965,11 @@ def inject_custom_css() -> None:
 
 
 def render_header(device_label: str, model_state: str, model_ok: bool) -> None:
-    device_class = "ok" if "CUDA" in device_label else "warn"
-    model_class = "ok" if model_ok else "warn"
     st.markdown(
-        f"""
+        """
         <div class="spartan-hero">
             <h1>SPARTAN</h1>
             <p>Satellite Pixel-Augmented Resolution &amp; Terrain Analysis Network</p>
-            <div class="badge-row">
-                <span class="badge">v{APP_VERSION}</span>
-                <span class="badge">SIH · Geospatial SR</span>
-                <span class="badge {device_class}">⚙ {device_label}</span>
-                <span class="badge {model_class}">◉ {model_state}</span>
-            </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -1032,7 +1039,6 @@ def run_fetch_pipeline(params: FetchParams) -> str:
 def render_sidebar() -> Dict[str, Any]:
     with st.sidebar:
         st.markdown("### SPARTAN")
-        st.caption(f"v{APP_VERSION} · {SIH_CONTEXT}")
         st.markdown("---")
 
         # ---- Input mode selector ----
@@ -1149,9 +1155,6 @@ def render_sidebar() -> Dict[str, Any]:
             help="Scales high-frequency residual relative to bicubic upsample.",
         )
         run = st.button("Run Enhancement", type="primary", use_container_width=True)
-
-        st.markdown("---")
-        st.caption("10 m → <2.5 m · CRS preserved")
 
     return {
         "uploaded": uploaded,
@@ -1406,33 +1409,33 @@ def main() -> None:
         except (ValueError, Exception) as exc:
             load_error = f"Could not read fetched file: {exc}"
 
-    else:
-        st.markdown(
-            "Upload a Sentinel-2 GeoTIFF in the sidebar, "
-            "**fetch new data** from Sentinel-2, or run on the "
-            "**synthetic placeholder** to exercise the pipeline."
-        )
-
     if load_error:
         st.error(load_error)
         st.stop()
 
+    is_synthetic = False
     if array is None or metadata is None:
         array, metadata = _synthetic_sentinel2()
         source_name = "synthetic_sentinel2.tif"
+        is_synthetic = True
+    elif metadata.tags.get("source") == "synthetic_sentinel2_placeholder":
+        is_synthetic = True
 
     # Preview before run
-    preview = select_display_bands(
-        array, controls["band_mode"], contrast=controls["contrast"]
-    )
-    with st.expander("Input preview", expanded=not controls["run"]):
-        st.image(preview, caption=f"Preview · {source_name}", use_container_width=True)
-        res_val = metadata.resolution[0]
-        res_display = f"{res_val:.2f} m/px" if res_val >= 0.1 else f"{res_val:.6g} deg/px"
-        st.caption(
-            f"{metadata.band_count} bands · {metadata.width}×{metadata.height} px · "
-            f"{res_display} · {metadata.crs}"
+    if is_synthetic:
+        st.info("Upload a Sentinel-2 GeoTIFF (.tif) in the sidebar to begin enhancement.")
+    else:
+        preview = select_display_bands(
+            array, controls["band_mode"], contrast=controls["contrast"]
         )
+        with st.expander("Input preview", expanded=not controls["run"]):
+            st.image(preview, caption=f"Preview · {source_name}", use_container_width=True)
+            res_val = metadata.resolution[0]
+            res_display = f"{res_val:.2f} m/px" if res_val >= 0.1 else f"{res_val:.6g} deg/px"
+            st.caption(
+                f"{metadata.band_count} bands · {metadata.width}×{metadata.height} px · "
+                f"{res_display} · {metadata.crs}"
+            )
 
     if "last_result" not in st.session_state:
         st.session_state["last_result"] = None
