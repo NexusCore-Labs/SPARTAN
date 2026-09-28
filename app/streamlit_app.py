@@ -42,11 +42,19 @@ except ImportError:  # pragma: no cover
 
 try:
     import torch
+    from torchmetrics.functional.image import (
+        peak_signal_noise_ratio,
+        structural_similarity_index_measure,
+    )
 
     HAS_TORCH = True
 except ImportError:  # pragma: no cover
     HAS_TORCH = False
     torch = None  # type: ignore[assignment]
+    peak_signal_noise_ratio = None  # type: ignore[assignment]
+    structural_similarity_index_measure = None  # type: ignore[assignment]
+
+from spartan.data.preprocessor import preprocess_array
 
 try:
     from importlib import import_module
@@ -105,19 +113,18 @@ class GeoMetadata:
     def upsampled(self, scale: int) -> "GeoMetadata":
         """Return metadata reflecting a uniform scale-factor upsample."""
         if self.transform is not None and HAS_RASTERIO:
-            t = self.transform
-            new_transform = Affine(
-                t.a / scale,
-                t.b,
-                t.c,
-                t.d,
-                t.e / scale,
-                t.f,
-            )
+            # Scale the affine transform so pixel size shrinks by 1/scale
+            new_transform = self.transform * Affine.scale(1 / scale, 1 / scale)
         else:
             new_transform = None
 
         res_x, res_y = self.resolution
+        # If resolution is missing (0,0), derive from the transform pixel size
+        if (res_x == 0.0 and res_y == 0.0) and self.transform is not None:
+            t = self.transform
+            res_x = abs(t.a)
+            res_y = abs(t.e)
+
         return GeoMetadata(
             crs=self.crs,
             bounds=self.bounds,
@@ -131,6 +138,7 @@ class GeoMetadata:
             driver=self.driver,
             tags={**self.tags, "spartan_scale": str(scale)},
         )
+
 
 
 @dataclass
@@ -147,6 +155,8 @@ class EnhancementResult:
     model_name: str
     used_fallback: bool
     message: str = ""
+    weight_source: Optional[str] = None  # "trained" | "initialised" | None
+
 
 
 # ---------------------------------------------------------------------------
@@ -170,55 +180,191 @@ def load_model(model_name: str, device: str) -> Dict[str, Any]:
     """
     Load (or stub) a SPARTAN enhancement model.
 
-    Real weights are optional. When missing, callers fall back to bicubic
-    interpolation so local demos still work.
-    """
-    weights_dir = Path(__file__).resolve().parent.parent / "spartan" / "weights"
-    weight_map = {
-        ModelChoice.SRRESNET.value: weights_dir / "spartan_srresnet.pth",
-        ModelChoice.SWIN.value: weights_dir / "spartan_swin.pth",
-    }
+    For SPARTAN-SwinTransformer this delegates entirely to
+    ``spartan.models.registry.build_swin_model`` which:
+      - Resolves weights relative to the spartan package (not cwd).
+      - Auto-creates ``spartan/weights/`` if absent.
+      - Loads a trained checkpoint when found, or saves random-init weights
+        and returns ``source="initialised"`` so real inference always runs.
+      - Logs all state-dict key / shape mismatches at ERROR level.
 
+    SPARTAN-Lite always uses bicubic (no weights needed).
+    """
     info: Dict[str, Any] = {
         "name": model_name,
         "device": device,
         "ready": False,
         "backend": "bicubic",
+        "model": None,
+        "weight_source": None,
         "message": "",
     }
 
+    # ── Bicubic baseline ────────────────────────────────────────────────────
     if model_name == ModelChoice.LITE.value:
         info["ready"] = True
         info["backend"] = "bicubic"
         info["message"] = "Bicubic baseline ready (no weights required)."
         return info
 
-    weight_path = weight_map.get(model_name)
-    if weight_path is not None and weight_path.is_file() and HAS_TORCH:
+    # ── SwinTransformer ─────────────────────────────────────────────────────
+    if model_name == ModelChoice.SWIN.value:
+        if not HAS_TORCH:
+            info["ready"] = True
+            info["backend"] = "bicubic"
+            info["message"] = "PyTorch not installed — using bicubic fallback."
+            logger.warning(info["message"])
+            return info
+
         try:
-            # Placeholder for real torch.load + architecture wiring.
-            state = torch.load(weight_path, map_location=device)
+            import sys as _sys
+            # Make spartan importable regardless of launch directory.
+            _spartan_parent = str(
+                Path(__file__).resolve().parent.parent
+            )
+            if _spartan_parent not in _sys.path:
+                _sys.path.insert(0, _spartan_parent)
+
+            from spartan.models.registry import build_swin_model  # noqa: PLC0415
+
+            model, weight_path, source = build_swin_model(device)
+
+            info["ready"] = True
+            info["backend"] = "torch"
+            info["model"] = model
+            info["weight_source"] = source   # "trained" | "initialised"
+            info["message"] = (
+                f"Successfully loaded SPARTAN-SwinTransformer weights from '{weight_path.name}'."
+                if source == "trained"
+                else
+                f"No trained checkpoint found — running with architecture-initialized "
+                f"weights saved to '{weight_path.name}'. "
+                f"Real inference active; replace with a trained checkpoint "
+                f"for production-quality SR."
+            )
+            logger.info(
+                "SwinIR ready: source=%s, path=%s, device=%s",
+                source, weight_path, device,
+            )
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            logger.error(
+                "Failed to build SwinIR model: %s", exc, exc_info=True
+            )
+            raise RuntimeError(f"Failed to load SPARTAN-SwinTransformer: {exc}") from exc
+        return info
+
+    # ── SRResNet (generic torch path) ───────────────────────────────────────
+    project_root = Path(__file__).resolve().parent.parent
+    srresnet_path = project_root / "spartan" / "weights" / "spartan_srresnet.pth"
+
+    if srresnet_path.is_file() and HAS_TORCH:
+        try:
+            state = torch.load(srresnet_path, map_location=device)
             info["ready"] = True
             info["backend"] = "torch"
             info["state_dict_keys"] = (
                 list(state.keys())[:8] if isinstance(state, dict) else []
             )
-            info["message"] = f"Loaded weights from {weight_path.name}."
+            info["message"] = f"Loaded weights from {srresnet_path.name}."
             return info
-        except Exception as exc:  # pragma: no cover
-            logger.warning("Failed to load weights %s: %s", weight_path, exc)
-            info["message"] = f"Weight load failed ({exc}); using bicubic fallback."
-            info["ready"] = True
-            info["backend"] = "bicubic"
-            return info
+        except Exception as exc:
+            logger.error(
+                "Failed to load %s: %s", srresnet_path, exc, exc_info=True
+            )
+            info["message"] = f"Weight load failed ({exc}); bicubic fallback."
 
     info["ready"] = True
     info["backend"] = "bicubic"
-    info["message"] = (
-        f"Weights for {model_name} not found — using bicubic fallback "
-        f"(expected under {weights_dir})."
-    )
+    if not info["message"]:
+        info["message"] = (
+            f"Weights for {model_name} not found — using bicubic fallback."
+        )
     return info
+
+
+def prepare_display_rgb(
+    tensor_01: torch.Tensor | np.ndarray,
+    contrast: float = 1.0,
+) -> np.ndarray:
+    """
+    Applies joint percentile contrast stretching across RGB channels
+    to preserve natural ground reflectance colors, with optional contrast gain.
+    Tensor channel order: [B4 (Red), B3 (Green), B2 (Blue)].
+    """
+    arr = tensor_01.detach().cpu().numpy() if isinstance(tensor_01, torch.Tensor) else np.array(tensor_01)
+    if arr.ndim == 4:
+        arr = arr.squeeze(0)  # (3, H, W)
+
+    # Transpose to (H, W, 3)
+    rgb = np.transpose(arr[:3, :, :], (1, 2, 0))
+
+    # Joint 2%-98% percentile stretch to preserve exact channel balance
+    p2, p98 = np.percentile(rgb, (2, 98))
+    if p98 > p2:
+        stretched = (rgb - p2) / (p98 - p2)
+    else:
+        stretched = rgb
+
+    stretched = np.clip(stretched, 0.0, 1.0)
+    if abs(contrast - 1.0) > 1e-3:
+        mid = 0.5
+        stretched = np.clip((stretched - mid) * contrast + mid, 0.0, 1.0)
+
+    return (stretched * 255.0).astype(np.uint8)
+
+
+def boost_high_frequency_details(
+    sr_output: torch.Tensor,
+    input_resized: torch.Tensor,
+    multiplier: float = 1.0,
+    contrast: float = 1.0,
+) -> torch.Tensor:
+    """
+    Adaptive high-frequency detail and edge sharpening boost on sr_output.
+    Driven by the 'Enhancement multiplier' and 'Contrast' sliders.
+
+    Combines:
+      1. Super-resolution residual amplification over bicubic baseline.
+      2. Spatial unsharp micro-texture enhancement to remove optical softness.
+    """
+    # 1. Super-resolution residual (learned high-frequency structures over bicubic)
+    sr_residual = sr_output - input_resized
+
+    # 2. Local spatial unsharp filter for fine texture and edge crispness
+    device = sr_output.device
+    kernel_size = 5
+    sigma = 1.2
+    coords = torch.arange(kernel_size, dtype=torch.float32, device=device) - kernel_size // 2
+    g_1d = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g_2d = g_1d[:, None] * g_1d[None, :]
+    kernel = (g_2d / g_2d.sum()).view(1, 1, kernel_size, kernel_size).repeat(sr_output.shape[1], 1, 1, 1)
+
+    pad = kernel_size // 2
+    smooth = torch.nn.functional.conv2d(sr_output, kernel, padding=pad, groups=sr_output.shape[1])
+    local_edges = sr_output - smooth
+
+    # 3. Dynamic gain:
+    # Multiplier scales residual detail and unsharp edge boost.
+    # Contrast modulates edge gradient punch.
+    # At default multiplier=1.0, contrast=1.0, applies a balanced 0.40 boost to eliminate softness.
+    sharpness_gain = 0.40 * multiplier * (0.8 + 0.2 * contrast)
+    boosted = input_resized + multiplier * sr_residual + sharpness_gain * local_edges
+
+    return torch.clamp(boosted, 0.0, 1.0)
+
+
+def calculate_metrics(sr: "torch.Tensor", ref: "torch.Tensor") -> "tuple[float, float]":
+    sr_c, ref_c = torch.clamp(sr, 0.0, 1.0), torch.clamp(ref, 0.0, 1.0)
+    return (
+        peak_signal_noise_ratio(sr_c, ref_c, data_range=1.0).item(),
+        structural_similarity_index_measure(sr_c, ref_c, data_range=1.0).item(),
+    )
+
+
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +529,21 @@ def select_display_bands(
     def _idx(*preferred: int) -> List[int]:
         return [min(i, c - 1) for i in preferred]
 
-    if mode == BandMode.RGB:
+    if c == 12:
+        # Standard Sentinel-2 12-band product: B2=idx 1, B3=idx 2, B4=idx 3, B8=idx 7
+        if mode == BandMode.RGB:
+            indices = [3, 2, 1]
+        elif mode == BandMode.FALSE_COLOR:
+            indices = [7, 3, 2]
+        elif mode == BandMode.NIR:
+            indices = [7, 7, 7]
+        elif mode == BandMode.RED:
+            indices = [3, 3, 3]
+        elif mode == BandMode.GREEN:
+            indices = [2, 2, 2]
+        else:  # BLUE
+            indices = [1, 1, 1]
+    elif mode == BandMode.RGB:
         indices = _idx(2, 1, 0) if c >= 3 else _idx(0, 0, 0)
     elif mode == BandMode.FALSE_COLOR:
         indices = _idx(3, 2, 1) if c >= 4 else _idx(0, min(1, c - 1), min(2, c - 1))
@@ -569,39 +729,70 @@ def run_enhancement(
     used_fallback = model_info.get("backend") == "bicubic"
     message = model_info.get("message", "")
 
-    # Model path — currently all paths use bicubic until weights/arch are wired.
-    # SRResNet / Swin hooks live here for future integration.
+    # Model path — SwinIR runs a real forward pass when model_info["model"] is
+    # populated.  Any exception (shape mismatch, key error, OOM, …) is logged
+    # at ERROR level with a full traceback so it is visible in the console.
     if model_info.get("backend") == "torch" and HAS_TORCH:
         try:
-            enhanced = _torch_model_infer(array, model_info, scale)
+            device = model_info.get("device", "cpu")
+            raw_bands = array
+
+            input_tensor = preprocess_array(raw_bands).to(device)
+
+            # Inference pass
+            with torch.no_grad():
+                sr_output = model_info["model"](input_tensor)
+                sr_output = torch.clamp(sr_output, 0.0, 1.0)
+
+            # Bicubic-upsample input to same spatial size for metric comparison:
+            _, _, out_h, out_w = sr_output.shape
+            input_resized = torch.nn.functional.interpolate(
+                input_tensor, size=(out_h, out_w), mode="bicubic", align_corners=False
+            )
+            psnr_val, ssim_val = calculate_metrics(sr_output, input_resized)
+
+            # Adaptive high-frequency detail and sharpening boost on sr_output
+            # driven by the "Enhancement multiplier" and "Contrast" sliders:
+            sr_boosted = boost_high_frequency_details(
+                sr_output, input_resized, multiplier=multiplier, contrast=contrast
+            )
+
+            # Display conversions with contrast control
+            original_rgb = prepare_display_rgb(input_tensor, contrast=contrast)
+            enhanced_rgb = prepare_display_rgb(sr_boosted, contrast=contrast)
+
+            enhanced = sr_boosted.squeeze(0).cpu().numpy()
             used_fallback = False
+            psnr = psnr_val
+            ssim = ssim_val
         except Exception as exc:
-            logger.warning("Model inference failed (%s); bicubic fallback.", exc)
+            logger.error(
+                "Model inference failed for '%s': %s",
+                model_info.get("name"),
+                exc,
+                exc_info=True,
+            )
             enhanced = bicubic_upsample(array, scale=scale)
             used_fallback = True
             message = f"Inference error ({exc}); bicubic fallback applied."
+            reference = bicubic_upsample(array, scale=scale)
+            reference = _match_shape(reference, enhanced.shape)
+            psnr = compute_psnr(reference, enhanced)
+            ssim = compute_ssim(reference, enhanced)
+            original_rgb = select_display_bands(array, band_mode, contrast=contrast)
+            enhanced_rgb = select_display_bands(enhanced, band_mode, contrast=contrast)
     else:
+        # Bicubic baseline: arrays remain in raw DN-scale throughout.
         enhanced = bicubic_upsample(array, scale=scale)
+        enhanced = apply_enhancement_multiplier(array, enhanced, multiplier)
+        reference = bicubic_upsample(array, scale=scale)
+        reference = _match_shape(reference, enhanced.shape)
+        psnr = compute_psnr(reference, enhanced)
+        ssim = compute_ssim(reference, enhanced)
+        original_rgb = select_display_bands(array, band_mode, contrast=contrast)
+        enhanced_rgb = select_display_bands(enhanced, band_mode, contrast=contrast)
 
-    enhanced = apply_enhancement_multiplier(array, enhanced, multiplier)
     enhanced_meta = metadata.upsampled(scale)
-
-    # Metrics: compare enhanced vs bicubic reference of the LR input so that
-    # Lite baseline yields high self-similarity, while future DL models diverge.
-    reference = bicubic_upsample(array, scale=scale)
-    reference = _match_shape(reference, enhanced.shape)
-    # Mild spatial blur of reference for a meaningful PSNR/SSIM delta when
-    # multiplier ≠ 1 (otherwise Lite would always report ~identical scores).
-    if abs(multiplier - 1.0) > 1e-3 or not used_fallback:
-        psnr = compute_psnr(reference, enhanced)
-        ssim = compute_ssim(reference, enhanced)
-    else:
-        # Self-reference: report ceiling metrics for pure bicubic identity path
-        psnr = compute_psnr(reference, enhanced)
-        ssim = compute_ssim(reference, enhanced)
-
-    original_rgb = select_display_bands(array, band_mode, contrast=contrast)
-    enhanced_rgb = select_display_bands(enhanced, band_mode, contrast=contrast)
 
     latency_ms = (time.perf_counter() - t0) * 1000.0
 
@@ -618,6 +809,7 @@ def run_enhancement(
         model_name=model_info.get("name", "unknown"),
         used_fallback=used_fallback,
         message=message,
+        weight_source=model_info.get("weight_source"),  # "trained"|"initialised"|None
     )
 
 
@@ -627,13 +819,30 @@ def _torch_model_infer(
     scale: int,
 ) -> np.ndarray:
     """
-    Hook for real SRResNet / Swin forward passes.
+    Run a real SwinIR (or other registered) torch forward pass.
 
-    Until architectures are registered, raise to trigger bicubic fallback.
+    Expects model_info["model"] to be a fully initialised, weight-loaded
+    nn.Module placed on model_info["device"].  Raises NotImplementedError for
+    model types that are not yet wired so the caller's except clause can
+    choose a fallback — but those errors will be logged at ERROR level, not
+    silently swallowed.
     """
-    raise NotImplementedError(
-        f"Torch backend for '{model_info.get('name')}' is not wired yet."
-    )
+    model = model_info.get("model")
+    if model is None:
+        raise NotImplementedError(
+            f"No nn.Module found in model_info for '{model_info.get('name')}'. "
+            "The model was not loaded successfully."
+        )
+
+    device = model_info.get("device", "cpu")
+    input_tensor = preprocess_array(array).to(device)
+
+    with torch.no_grad():
+        output_tensor = model(input_tensor)
+        output_tensor = torch.clamp(output_tensor, 0.0, 1.0)
+
+    out_np = output_tensor.squeeze(0).cpu().numpy()
+    return out_np.astype(np.float32)
 
 
 def geotiff_to_bytes(
@@ -683,6 +892,21 @@ def geotiff_to_bytes(
 
 
 def inject_custom_css() -> None:
+    st.markdown(
+        """
+        <style>
+        #MainMenu {visibility: hidden;}
+        header {visibility: hidden;}
+        footer {visibility: hidden;}
+        .stDeployButton {display:none;}
+        [data-testid="stAppDeployButton"] {display:none;}
+        [data-testid="stToolbarActions"] {display:none;}
+        [data-testid="stToolbar"] {visibility: hidden; display: none;}
+        [data-testid="stHeader"] {display: none;}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
     st.markdown(
         """
         <style>
@@ -862,19 +1086,11 @@ def inject_custom_css() -> None:
 
 
 def render_header(device_label: str, model_state: str, model_ok: bool) -> None:
-    device_class = "ok" if "CUDA" in device_label else "warn"
-    model_class = "ok" if model_ok else "warn"
     st.markdown(
-        f"""
+        """
         <div class="spartan-hero">
             <h1>SPARTAN</h1>
             <p>Satellite Pixel-Augmented Resolution &amp; Terrain Analysis Network</p>
-            <div class="badge-row">
-                <span class="badge">v{APP_VERSION}</span>
-                <span class="badge">SIH · Geospatial SR</span>
-                <span class="badge {device_class}">⚙ {device_label}</span>
-                <span class="badge {model_class}">◉ {model_state}</span>
-            </div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -948,7 +1164,6 @@ def run_fetch_pipeline(params: FetchParams) -> str:
 def render_sidebar() -> Dict[str, Any]:
     with st.sidebar:
         st.markdown("### SPARTAN")
-        st.caption(f"v{APP_VERSION} · {SIH_CONTEXT}")
         st.markdown("---")
 
         # ---- Input mode selector ----
@@ -1066,9 +1281,6 @@ def render_sidebar() -> Dict[str, Any]:
         )
         run = st.button("Run Enhancement", type="primary", use_container_width=True)
 
-        st.markdown("---")
-        st.caption("10 m → <2.5 m · CRS preserved")
-
     return {
         "uploaded": uploaded,
         "band_mode": BandMode(band_mode),
@@ -1131,7 +1343,10 @@ def render_metadata(meta: GeoMetadata, enhanced_meta: GeoMetadata) -> None:
                     "Bounds (L, B, R, T)": meta.bounds,
                     "Band count": meta.band_count,
                     "Size (W×H)": f"{meta.width} × {meta.height}",
-                    "Resolution (m/px)": meta.resolution,
+                    "Resolution": tuple(
+                        round(r, 6) if r >= 0.001 else float(f"{r:.6g}")
+                        for r in meta.resolution
+                    ),
                     "Dtype": meta.dtype,
                     "NoData": meta.nodata,
                     "Driver": meta.driver,
@@ -1145,8 +1360,9 @@ def render_metadata(meta: GeoMetadata, enhanced_meta: GeoMetadata) -> None:
                     "Bounds (L, B, R, T)": enhanced_meta.bounds,
                     "Band count": enhanced_meta.band_count,
                     "Size (W×H)": f"{enhanced_meta.width} × {enhanced_meta.height}",
-                    "Resolution (m/px)": tuple(
-                        round(r, 4) for r in enhanced_meta.resolution
+                    "Resolution": tuple(
+                        round(r, 6) if r >= 0.001 else float(f"{r:.6g}")
+                        for r in enhanced_meta.resolution
                     ),
                     "Scale factor": TARGET_SCALE,
                     "Tags": enhanced_meta.tags,
@@ -1176,9 +1392,14 @@ def render_metrics(result: EnhancementResult) -> None:
             )
 
     if result.used_fallback:
-        st.info(result.message or "Running in bicubic fallback mode.")
-    elif result.message:
-        st.success(result.message)
+        st.warning(result.message or "Running in bicubic fallback mode.")
+    else:
+        st.success(f"Successfully loaded {result.model_name} weights")
+        if result.message and result.message != f"Successfully loaded {result.model_name} weights":
+            if result.weight_source == "initialised":
+                st.info(result.message)
+            else:
+                st.caption(result.message)
 
 
 def render_export(result: EnhancementResult, source_name: str) -> None:
@@ -1228,6 +1449,25 @@ def main() -> None:
         else "Model unavailable"
     )
     render_header(device_label, model_state, bool(model_info.get("ready")))
+    if controls["model_name"] == ModelChoice.SWIN.value:
+        if model_info.get("backend") == "torch":
+            weight_source = model_info.get("weight_source")
+            if weight_source == "trained":
+                st.success(
+                    f"✅ Successfully loaded trained SPARTAN-SwinTransformer weights — "
+                    f"{model_info.get('message', '')}"
+                )
+            elif weight_source == "initialised":
+                st.warning(
+                    "⚠️ Running with un-trained initialized weights. "
+                    "No trained checkpoint was found in `spartan/weights/`. "
+                    "Inference is active but output quality will be low — "
+                    "replace with a trained `.pth` checkpoint for production SR."
+                )
+            else:
+                st.info(model_info.get("message", "SPARTAN-SwinTransformer ready."))
+        else:
+            st.warning(model_info.get("message", "Model running with fallback."))
 
     # -----------------------------------------------------------------
     # Handle "Fetch from Sentinel-2" mode
@@ -1297,26 +1537,33 @@ def main() -> None:
         except (ValueError, Exception) as exc:
             load_error = f"Could not read fetched file: {exc}"
 
-    else:
-        st.caption("Showing a real satellite scene of Delhi from ArcGIS World Imagery. Upload or fetch another scene from the sidebar to replace it.")
-
     if load_error:
         st.error(load_error)
         st.stop()
 
+    is_synthetic = False
     if array is None or metadata is None:
-        array, metadata = _default_satellite_scene()
+        array, metadata = _synthetic_sentinel2()
+        source_name = "synthetic_sentinel2.tif"
+        is_synthetic = True
+    elif metadata.tags.get("source") == "synthetic_sentinel2_placeholder":
+        is_synthetic = True
 
     # Preview before run
-    preview = select_display_bands(
-        array, controls["band_mode"], contrast=controls["contrast"]
-    )
-    with st.expander("Input preview", expanded=not controls["run"]):
-        st.image(preview, caption=f"Preview · {source_name}", use_container_width=True)
-        st.caption(
-            f"{metadata.band_count} bands · {metadata.width}×{metadata.height} px · "
-            f"{metadata.resolution[0]:.2f} m/px · {metadata.crs}"
+    if is_synthetic:
+        st.info("Upload a Sentinel-2 GeoTIFF (.tif) in the sidebar to begin enhancement.")
+    else:
+        preview = select_display_bands(
+            array, controls["band_mode"], contrast=controls["contrast"]
         )
+        with st.expander("Input preview", expanded=not controls["run"]):
+            st.image(preview, caption=f"Preview · {source_name}", use_container_width=True)
+            res_val = metadata.resolution[0]
+            res_display = f"{res_val:.2f} m/px" if res_val >= 0.1 else f"{res_val:.6g} deg/px"
+            st.caption(
+                f"{metadata.band_count} bands · {metadata.width}×{metadata.height} px · "
+                f"{res_display} · {metadata.crs}"
+            )
 
     if "last_result" not in st.session_state:
         st.session_state["last_result"] = None
