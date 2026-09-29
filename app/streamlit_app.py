@@ -164,6 +164,8 @@ class EnhancementResult:
     used_fallback: bool
     message: str = ""
     weight_source: Optional[str] = None  # "trained" | "initialised" | None
+    sam: float = 0.0
+    ergas: float = 0.0
 
 
 
@@ -731,6 +733,66 @@ def compute_ssim(reference: np.ndarray, estimate: np.ndarray) -> float:
     return float(np.clip(num / (den + 1e-12), -1.0, 1.0))
 
 
+def calculate_sam(sr_tensor: np.ndarray, ref_tensor: np.ndarray) -> float:
+    """
+    Calculates the Spectral Angle Mapper (SAM) between the Super-Resolved image and Reference.
+    Inputs should be NumPy arrays of shape (H, W, Bands).
+    """
+    sr = sr_tensor.astype(np.float64)
+    ref = ref_tensor.astype(np.float64)
+
+    if sr.ndim == 2:
+        sr = sr[:, :, np.newaxis]
+        ref = ref[:, :, np.newaxis]
+    elif sr.ndim == 3 and sr.shape[0] < sr.shape[1] and sr.shape[0] < sr.shape[2]:
+        sr = np.transpose(sr, (1, 2, 0))
+        ref = np.transpose(ref, (1, 2, 0))
+
+    # Calculate dot product and norms across the spectral axis (bands)
+    dot_product = np.sum(sr * ref, axis=-1)
+    norm_sr = np.linalg.norm(sr, axis=-1)
+    norm_ref = np.linalg.norm(ref, axis=-1)
+
+    # Prevent division by zero
+    denominator = norm_sr * norm_ref
+    denominator[denominator == 0] = 1e-10
+
+    cos_theta = np.clip(dot_product / denominator, -1.0, 1.0)
+    sam_map = np.arccos(cos_theta)
+
+    # Return the mean SAM across all pixels (in radians)
+    return float(np.mean(sam_map))
+
+
+def calculate_ergas(sr_tensor: np.ndarray, ref_tensor: np.ndarray, scaling_factor: float = 4.0) -> float:
+    """
+    Calculates ERGAS to measure overall radiometric distortion.
+    scaling_factor is the resolution ratio (e.g., 4 for 10m to 2.5m).
+    """
+    sr = sr_tensor.astype(np.float64)
+    ref = ref_tensor.astype(np.float64)
+
+    if sr.ndim == 2:
+        sr = sr[:, :, np.newaxis]
+        ref = ref[:, :, np.newaxis]
+    elif sr.ndim == 3 and sr.shape[0] < sr.shape[1] and sr.shape[0] < sr.shape[2]:
+        sr = np.transpose(sr, (1, 2, 0))
+        ref = np.transpose(ref, (1, 2, 0))
+
+    # Calculate RMSE and Mean for each band
+    rmse_per_band = np.sqrt(np.mean((sr - ref) ** 2, axis=(0, 1)))
+    mean_ref_per_band = np.mean(ref, axis=(0, 1))
+
+    # Prevent division by zero
+    mean_ref_per_band[mean_ref_per_band == 0] = 1e-10
+
+    # Calculate normalized error sum
+    normalized_error = np.mean((rmse_per_band / mean_ref_per_band) ** 2)
+
+    ergas = (100.0 / scaling_factor) * np.sqrt(normalized_error)
+    return float(ergas)
+
+
 # ---------------------------------------------------------------------------
 # Enhancement pipeline
 # ---------------------------------------------------------------------------
@@ -786,6 +848,10 @@ def run_enhancement(
             used_fallback = False
             psnr = psnr_val
             ssim = ssim_val
+            sr_hwc = np.transpose(enhanced, (1, 2, 0))
+            ref_hwc = np.transpose(input_resized.squeeze(0).cpu().numpy(), (1, 2, 0))
+            sam = calculate_sam(sr_hwc, ref_hwc)
+            ergas = calculate_ergas(sr_hwc, ref_hwc, scaling_factor=scale)
         except Exception as exc:
             logger.error(
                 "Model inference failed for '%s': %s",
@@ -800,6 +866,10 @@ def run_enhancement(
             reference = _match_shape(reference, enhanced.shape)
             psnr = compute_psnr(reference, enhanced)
             ssim = compute_ssim(reference, enhanced)
+            sr_hwc = np.transpose(enhanced, (1, 2, 0))
+            ref_hwc = np.transpose(reference, (1, 2, 0))
+            sam = calculate_sam(sr_hwc, ref_hwc)
+            ergas = calculate_ergas(sr_hwc, ref_hwc, scaling_factor=scale)
             original_rgb = select_display_bands(array, band_mode, contrast=contrast)
             enhanced_rgb = select_display_bands(enhanced, band_mode, contrast=contrast)
     else:
@@ -810,6 +880,10 @@ def run_enhancement(
         reference = _match_shape(reference, enhanced.shape)
         psnr = compute_psnr(reference, enhanced)
         ssim = compute_ssim(reference, enhanced)
+        sr_hwc = np.transpose(enhanced, (1, 2, 0))
+        ref_hwc = np.transpose(reference, (1, 2, 0))
+        sam = calculate_sam(sr_hwc, ref_hwc)
+        ergas = calculate_ergas(sr_hwc, ref_hwc, scaling_factor=scale)
         original_rgb = select_display_bands(array, band_mode, contrast=contrast)
         enhanced_rgb = select_display_bands(enhanced, band_mode, contrast=contrast)
 
@@ -826,6 +900,8 @@ def run_enhancement(
         enhanced_metadata=enhanced_meta,
         psnr=psnr,
         ssim=ssim,
+        sam=sam,
+        ergas=ergas,
         latency_ms=latency_ms,
         model_name=model_info.get("name", "unknown"),
         used_fallback=used_fallback,
@@ -1394,23 +1470,29 @@ def render_metadata(meta: GeoMetadata, enhanced_meta: GeoMetadata) -> None:
 def render_metrics(result: EnhancementResult) -> None:
     render_section_kicker("Model telemetry")
     st.subheader("Analytics & metrics")
-    cols = st.columns(3)
-    cards = [
-        ("PSNR", f"{result.psnr:.2f} dB"),
-        ("SSIM", f"{result.ssim:.4f}"),
-        ("Latency", f"{result.latency_ms:.1f} ms"),
-    ]
-    for col, (label, value) in zip(cols, cards):
-        with col:
-            st.markdown(
-                f"""
-                <div class="metric-card">
-                    <div class="label">{label}</div>
-                    <div class="value">{value}</div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+
+    psnr_val = result.psnr
+    sam_val = result.sam
+    ergas_val = result.ergas
+
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.metric(label="PSNR", value=f"{psnr_val:.2f} dB")
+
+    with col2:
+        # Lower SAM is better; typical good values are under 0.15 radians
+        st.metric(label="SAM", value=f"{sam_val:.4f} rad")
+
+    with col3:
+        # Lower ERGAS is better; typical good values are under 3.0
+        st.metric(label="ERGAS", value=f"{ergas_val:.2f}")
+
+    col4, col5 = st.columns(2)
+    with col4:
+        st.metric(label="SSIM", value=f"{result.ssim:.4f}")
+    with col5:
+        st.metric(label="Latency", value=f"{result.latency_ms:.1f} ms")
 
     if result.used_fallback:
         st.warning(result.message or "Running in bicubic fallback mode.")
